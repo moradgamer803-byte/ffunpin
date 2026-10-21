@@ -107,7 +107,31 @@ public class FFHook implements IXposedHookLoadPackage {
      * visibility), so walk the module class loader's dex path list instead.
      */
     private String moduleApkPath() {
-        // a) BaseDexClassLoader.pathList.dexElements[i].path
+        // a) pointer file dropped by the installer (/data/local/tmp is readable,
+        //    only exec is blocked there) — deterministic, no visibility issues
+        try {
+            File ptr = new File("/data/local/tmp/ffunpin_apk.txt");
+            if (ptr.canRead()) {
+                for (String line : java.nio.file.Files.readAllLines(ptr.toPath())) {
+                    String p = line.trim();
+                    if (p.endsWith(".apk") && new File(p).isFile()) { log("apk via pointer file"); return p; }
+                }
+            }
+        } catch (Throwable t) { log("pointer: " + t); }
+
+        // b) /proc/self/maps — the module apk may be mapped by the loader
+        try {
+            for (String line : java.nio.file.Files.readAllLines(
+                    java.nio.file.Paths.get("/proc/self/maps"))) {
+                int i = line.indexOf("/data/app/");
+                int j = line.indexOf(".apk", i < 0 ? 0 : i);
+                if (i < 0 || j < 0) continue;
+                String path = line.substring(i, j + 4);
+                if (path.contains("com.zyvo.ffunpin")) { log("apk via maps"); return path; }
+            }
+        } catch (Throwable t) { log("maps: " + t); }
+
+        // c) BaseDexClassLoader.pathList.dexElements[i].path
         try {
             ClassLoader cl = FFHook.class.getClassLoader();
             if (cl instanceof dalvik.system.BaseDexClassLoader) {
@@ -115,24 +139,28 @@ public class FFHook implements IXposedHookLoadPackage {
                 Object[] elements = (Object[]) XposedHelpers.getObjectField(pathList, "dexElements");
                 for (Object el : elements) {
                     Object p = XposedHelpers.getObjectField(el, "path");
-                    if (p instanceof File) {
-                        File f = (File) p;
-                        if (f.isFile() && f.getName().endsWith(".apk")) return f.getAbsolutePath();
+                    if (p instanceof File && ((File) p).getName().endsWith(".apk")) {
+                        log("apk via dexElements");
+                        return ((File) p).getAbsolutePath();
+                    }
+                    if (p instanceof File && ((File) p).getAbsolutePath().contains("ffunpin")) {
+                        log("apk via dexElements (non-apk entry)");
+                        return ((File) p).getAbsolutePath();
                     }
                 }
+            } else {
+                log("classloader: " + cl.getClass().getName());
             }
         } catch (Throwable t) { log("dexPath: " + t); }
 
-        // b) /proc/self/maps — the module apk is mapped by the class loader
+        // d) last resort: CodeSource of this class
         try {
-            for (String line : java.nio.file.Files.readAllLines(
-                    java.nio.file.Paths.get("/proc/self/maps"))) {
-                int i = line.indexOf("/data/app/");
-                if (i < 0) continue;
-                String path = line.substring(i).trim();
-                if (path.contains("com.zyvo.ffunpin") && path.endsWith(".apk")) return path;
+            java.security.CodeSource cs = FFHook.class.getProtectionDomain().getCodeSource();
+            if (cs != null && cs.getLocation() != null) {
+                log("apk via codeSource");
+                return new File(cs.getLocation().toURI()).getAbsolutePath();
             }
-        } catch (Throwable t) { log("maps: " + t); }
+        } catch (Throwable t) { log("codeSource: " + t); }
         return null;
     }
 
