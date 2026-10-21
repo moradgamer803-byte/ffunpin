@@ -37,6 +37,14 @@ android {
     buildFeatures {
         buildConfig true
     }
+
+    // extract libffunpin.so into /data/app/<pkg>/lib/arm64 at install time:
+    // that domain is executable on Android 10+, an app-data copy is not
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
 }
 
 dependencies {

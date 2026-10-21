@@ -4,7 +4,8 @@
     <application
         android:label="@string/app_name"
         android:icon="@android:drawable/ic_lock_lock"
-        android:allowBackup="false">
+        android:allowBackup="false"
+        android:extractNativeLibs="true">
 
         <meta-data
             android:name="xposedmodule"

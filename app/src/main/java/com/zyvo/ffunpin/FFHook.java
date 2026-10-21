@@ -46,7 +46,6 @@ public class FFHook implements IXposedHookLoadPackage {
 
     private static void log(String s) {
         Log.i(TAG, s);
-        try { XposedBridge.log(TAG + ": " + s); } catch (Throwable ignored) { }
     }
 
     @Override
@@ -64,19 +63,31 @@ public class FFHook implements IXposedHookLoadPackage {
     // ---------------------------------------------------------------- native
 
     private void loadNative(XC_LoadPackage.LoadPackageParam lpparam) throws Exception {
-        if (!"arm64-v8a".equals(Build.SUPPORTED_ABIS[0])) {
-            log("abi " + Build.SUPPORTED_ABIS[0] + " not patched (arm64 only)");
-            return;
-        }
-        String moduleApk = moduleApkPath(lpparam);
-        if (moduleApk == null) { log("module apk path not found"); return; }
+        String abi = Build.SUPPORTED_ABIS[0];
+        if (!"arm64-v8a".equals(abi)) { log("abi " + abi + " not patched (arm64 only)"); return; }
 
+        String apk = moduleApkPath();
+        log("module apk: " + apk);
+
+        // 1) preferred: lib extracted when the module was installed — that path
+        //    lives on the apk_lib_file domain, so it is executable on Android 10+
+        if (apk != null) {
+            File lib = new File(new File(new File(apk).getParentFile(), "lib"), abi + "/libffunpin.so");
+            if (lib.exists()) {
+                System.load(lib.getAbsolutePath());
+                log("native loaded (install dir): " + lib + " " + lib.length() + "B");
+                return;
+            }
+            log("install-dir lib missing: " + lib);
+        }
+
+        // 2) fallback: unpack into the app's own data dir (exec may be blocked on A10+)
+        if (apk == null) { log("module apk path not found"); return; }
         File outDir = new File(lpparam.appInfo.dataDir, "ffunpin");
         if (!outDir.exists() && !outDir.mkdirs()) { log("cannot mkdir " + outDir); return; }
         File so = new File(outDir, "libffunpin.so");
-
-        try (ZipFile zip = new ZipFile(moduleApk)) {
-            ZipEntry e = zip.getEntry("lib/arm64-v8a/libffunpin.so");
+        try (ZipFile zip = new ZipFile(apk)) {
+            ZipEntry e = zip.getEntry("lib/" + abi + "/libffunpin.so");
             if (e == null) { log("lib missing in module apk"); return; }
             try (InputStream in = zip.getInputStream(e);
                  FileOutputStream fos = new FileOutputStream(so)) {
@@ -88,30 +99,40 @@ public class FFHook implements IXposedHookLoadPackage {
         so.setReadable(true, false);
         so.setExecutable(true, false);
         System.load(so.getAbsolutePath());
-        log("native loaded: " + so + " (" + so.length() + "B)");
+        log("native loaded (data dir): " + so + " " + so.length() + "B");
     }
 
-    private String moduleApkPath(XC_LoadPackage.LoadPackageParam lpparam) {
+    /**
+     * PackageManager cannot answer for our module from inside the game (package
+     * visibility), so walk the module class loader's dex path list instead.
+     */
+    private String moduleApkPath() {
+        // a) BaseDexClassLoader.pathList.dexElements[i].path
         try {
-            Class<?> at = Class.forName("android.app.ActivityThread");
-            Object thread = at.getMethod("currentActivityThread").invoke(null);
-            Context ctx = null;
-            if (thread != null) {
-                Object sys = XposedHelpers.callMethod(thread, "getSystemContext");
-                if (sys instanceof Context) ctx = (Context) sys;
+            ClassLoader cl = FFHook.class.getClassLoader();
+            if (cl instanceof dalvik.system.BaseDexClassLoader) {
+                Object pathList = XposedHelpers.getObjectField(cl, "pathList");
+                Object[] elements = (Object[]) XposedHelpers.getObjectField(pathList, "dexElements");
+                for (Object el : elements) {
+                    Object p = XposedHelpers.getObjectField(el, "path");
+                    if (p instanceof File) {
+                        File f = (File) p;
+                        if (f.isFile() && f.getName().endsWith(".apk")) return f.getAbsolutePath();
+                    }
+                }
             }
-            if (ctx == null) ctx = (Context) XposedHelpers.getStaticObjectField(at, "mInitialApplication");
-            if (ctx == null) return null;
-            ApplicationInfo ai = ctx.getPackageManager().getApplicationInfo(MODULE_PKG, 0);
-            return ai.sourceDir;
-        } catch (Throwable t) {
-            log("moduleApkPath: " + t);
-        }
-        // fallback: some LSPosed builds put the module apk in the classpath
+        } catch (Throwable t) { log("dexPath: " + t); }
+
+        // b) /proc/self/maps — the module apk is mapped by the class loader
         try {
-            java.security.CodeSource cs = FFHook.class.getProtectionDomain().getCodeSource();
-            if (cs != null && cs.getLocation() != null) return new File(cs.getLocation().toURI()).getAbsolutePath();
-        } catch (Throwable ignored) { }
+            for (String line : java.nio.file.Files.readAllLines(
+                    java.nio.file.Paths.get("/proc/self/maps"))) {
+                int i = line.indexOf("/data/app/");
+                if (i < 0) continue;
+                String path = line.substring(i).trim();
+                if (path.contains("com.zyvo.ffunpin") && path.endsWith(".apk")) return path;
+            }
+        } catch (Throwable t) { log("maps: " + t); }
         return null;
     }
 
